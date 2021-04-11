@@ -1,0 +1,7 @@
+flax
+jax
+jaxlib
+numpy
+optax
+tabulate
+tqdm
