@@ -1,7 +1,6 @@
 import csv
 import itertools
 import time
-import traceback
 import typing as tp
 from collections import OrderedDict
 from datetime import datetime
@@ -177,12 +176,12 @@ def merge_nested_dicts(*ds):
     return unflatten_dict(merged)
 
 
-def get_train_step(
-        apply_fn: tp.Callable[[Variables, MiniBatch], tp.Tuple[tp.Any, tp.Dict]],
-        loss_fn: tp.Callable[[tp.Any, MiniBatch], jnp.ndarray],
-        opt_update: optax.TransformUpdateFn,
-        update_metrics: tp.Callable[..., Metrics],
-        distributed: bool = False) -> tp.Callable[[TrainState, MiniBatch], TrainState]:
+def get_train_step(apply_fn: tp.Callable[[Variables, MiniBatch], tp.Tuple[tp.Any,
+                                                                          tp.Dict]],
+                   loss_fn: tp.Callable[[tp.Any, MiniBatch], jnp.ndarray],
+                   opt_update: optax.TransformUpdateFn,
+                   update_metrics: tp.Callable[..., Metrics],
+                   distributed: bool = False) -> TrainStep:
 
     def train_step(state, batch):
 
@@ -244,99 +243,141 @@ def cos_onecycle_momentum(num_steps,
         })
 
 
-class _DummyCSVFile:
+class _DummyWriter:
 
-    def writerow(self, *_):
+    def flush(self):
+        pass
+
+    def write(self, _):
         pass
 
     def close(self):
         pass
 
+    def scalar(self, *_):
+        pass
 
-# TODO: Fix formatting.
-# yapf: disable
-def train(cfg,
-          state,
-          train_iter,
-          val_iter,
-          train_step,
-          val_step,
-          filefmt='%Y-%m-%d_%H-%M-%S',
-          printfmt='%Y-%m-%d %H:%M:%S',
-          distributed=False,
-          write_csv=False,
-          save_ckpts=True,
-          ckpt_metric='loss'):
 
-    assert cfg.eval_freq % cfg.report_freq == 0
+class Reporter:
 
-    headers = list(itertools.chain(
-        ['Timestamp', 'Iter'], state.metrics.names(), ['Time/Step'],
-        map('Val {}'.format, state.metrics.names()), ['Val Time', 'Ckpt?']))
-    table_fn = partial(tabulate.tabulate, headers=headers,
-                       tablefmt="github", floatfmt="3.4f")
-    print('\n'.join(table_fn([
-        [datetime.utcnow().strftime(printfmt), cfg.num_steps] +
-        [100.0] * (len(headers) - 3) + [None]]).split('\n')[:2]))
+    def __init__(self,
+                 train_names,
+                 val_names,
+                 print_names=None,
+                 filefmt='%Y-%m-%d_%H-%M-%S',
+                 printfmt='%Y-%m-%d %H:%M:%S',
+                 tabulate_fn=partial(tabulate.tabulate,
+                                     tablefmt="github",
+                                     floatfmt="9.4f"),
+                 write_csv=False,
+                 summary_writer=_DummyWriter()):
 
-    train_iter = iter(tqdm(itertools.islice(train_iter, 0, cfg.num_steps),
-                           total=cfg.num_steps, desc='Training', smoothing=0))
+        def get_header(x):
+            header = itertools.chain(['timestamp', 'iter'], list(x), ['time/step'],
+                                     (f'val_{n}' for n in val_names))
+            return list(header)
 
-    try:
-        timestamp = datetime.utcnow().strftime(filefmt)
-        csvfile = (open(f'{timestamp}_trainlog.csv', 'w', newline='')
-                   if write_csv else _DummyCSVFile())
-        traincsv = (csv.writer(csvfile, quoting=csv.QUOTE_MINIMAL)
-                    if write_csv else csvfile)
-        traincsv.writerow(headers)
+        self.train_names = train_names
+        self.val_names = val_names
+        self.print_names = train_names if print_names is None else print_names
+        self.header_csv = get_header(train_names)
+        self.header_print = get_header(print_names)
+        self.tabulate_csv = partial(tabulate_fn, headers=self.header_csv)
+        self.tabulate_print = partial(tabulate_fn, headers=self.header_print)
+        self.log_stamp = lambda: datetime.utcnow().strftime(printfmt)
+        self.open_csv = lambda: (open(
+            f'{datetime.utcnow().strftime(filefmt)}_trainlog.csv', 'w', newline='')
+                                 if write_csv else _DummyWriter())
+        self.tb = summary_writer
 
+    def __enter__(self):
+        self.csvfile = self.open_csv()
+        self.traincsv = csv.writer(self.csvfile, quoting=csv.QUOTE_MINIMAL)
+        self.traincsv.writerow(self.header_csv)
+        print('\n'.join(
+            self.tabulate_print([[self.log_stamp(), 100_000] + [1.0] *
+                                 (len(self.header_print) - 2)]).split('\n')[:2]))
+        self.start_time = time.perf_counter()
+        self.iteration = -1
+
+        return self
+
+    def __exit__(self, *_):  # type, value, tb):
+        self.csvfile.close()
+
+    def report(self, iteration, train_dict, val_dict={}):
+        time_per_step = (time.perf_counter() - self.start_time) / (iteration -
+                                                                   self.iteration)
+
+        prefix = [self.log_stamp(), iteration]
+        suffix = [time_per_step] + [val_dict.get(k, None) for k in self.val_names]
+        csv_vals = prefix + [train_dict.get(k, None) for k in self.train_names] + suffix
+        print_vals = prefix + [train_dict[k] for k in self.print_names] + suffix
+
+        print(self.tabulate_print([print_vals]).split('\n')[2])
+        self.traincsv.writerow(csv_vals)
+
+        self.start_time, self.iteration = time.perf_counter(), iteration
+
+        for k, v in train_dict.items():
+            self.tb.scalar(k, v, iteration)
+
+        for k, v in val_dict.items():
+            self.tb.scalar(f'val_{k}', v, iteration)
+
+
+def train(state: TrainState,
+          train_iter: tp.Iterator[MiniBatch],
+          val_iter: tp.Iterator[MiniBatch],
+          train_step: TrainStep,
+          val_step: tp.Callable[[MiniBatch, tp.Any, Metrics], Metrics],
+          n_steps: int,
+          val_freq: int,
+          report_freq: int,
+          reporter: Reporter,
+          val_metrics: Metrics,
+          distributed: bool = False,
+          save_ckpts: bool = True,
+          ckpt_metric: str = 'loss',
+          ckpt_name: str = 'model') -> TrainState:
+
+    assert val_freq % report_freq == 0
+    assert 'time' in reporter.val_names
+
+    iter_slice = itertools.islice(train_iter, 0, n_steps)
+    train_iter = iter(tqdm(iter_slice, total=n_steps, desc='Training', smoothing=0))
+
+    with reporter as rep:
         cur_best = -1
-        start_time = time.perf_counter()
         for i, batch in enumerate(train_iter):
             state = train_step(state, batch)
 
-            if i % cfg.report_freq == 0:
-                time_per_step = (time.perf_counter() - start_time) / cfg.report_freq
-                report_values = ([datetime.utcnow().strftime(printfmt), i] +
-                                 list(state.metrics.values()) + [time_per_step])
+            if i % report_freq == 0:
+                train_dict = dict(state.metrics.items())
+                val_dict = {}
                 state = state.replace(metrics=state.metrics.reset())
-                start_time = time.perf_counter()
 
-                if i % cfg.eval_freq == 0:
+                if i % val_freq == 0:
                     start_time = time.perf_counter()
                     val_state = (state if not distributed else
                                  flax.jax_utils.unreplicate(state))
                     variables = val_state.variables
-                    val_metrics = state.metrics.reset()
+                    val_metrics = val_metrics.reset()
                     for val_batch in val_iter:
                         val_metrics = val_step(val_batch, variables, val_metrics)
-                    elapsed = time.perf_counter() - start_time
-                    report_values.extend(val_metrics.values() + [elapsed])
+                    val_dict = dict(val_metrics.items())
+                    val_dict['time'] = time.perf_counter() - start_time
 
                     ckpt_metric_val = val_metrics[ckpt_metric]
                     if save_ckpts and cur_best < ckpt_metric_val:
-                        report_values.append('Yes')
                         cur_best = ckpt_metric_val
-                        flax.training.checkpoints.save_checkpoint(
-                            f'ckpts_{cfg.name}',
-                            jax.device_get(jax.tree_leaves(val_state)),
-                            i,
-                            keep=5)
-                    else:
-                        report_values.append('No')
-                else:
-                    report_values.extend(None for _ in range(len(val_metrics) + 2))
+                        # OrderedDict can't be serialized
+                        flat_state = jax.device_get(jax.tree_leaves(val_state))
+                        flax.training.checkpoints.save_checkpoint(f'ckpts_{ckpt_name}',
+                                                                  flat_state,
+                                                                  i,
+                                                                  keep=5)
 
-                print(table_fn([report_values]).split('\n')[2])
-                traincsv.writerow(report_values)
-                start_time = time.perf_counter()
-
-    except Exception:
-        print(traceback.format_exc())
-    finally:
-        csvfile.close()
+                rep.report(i, train_dict, val_dict)
 
     return state
-
-
-# yapf: enable

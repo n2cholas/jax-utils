@@ -40,6 +40,11 @@ def update_metrics(state, batch, loss, output, grads):
     return state.metrics.update(loss=loss)
 
 
+def eval_step(batch, variables, metrics):
+    output = model.apply(variables, batch['input'])
+    return metrics.update(loss=loss_fn(output, batch))
+
+
 def get_find_lr_train_step(update_fn):
     return jax_utils.get_train_step(apply_fn=apply_fn,
                                     loss_fn=loss_fn,
@@ -78,27 +83,24 @@ def test_train_step():
 
 def test_train_loop():
 
-    class cfg:
-        num_steps = 500
-        report_freq = 20
-        eval_freq = 100
-        # name = 'tmp'  # only needed for ckpting
-
-    def eval_step(batch, variables, metrics):
-        output = model.apply(variables, batch['input'])
-        return metrics.update(loss=loss_fn(output, batch))
-
     train_step = jax.jit(
         jax_utils.get_train_step(apply_fn=apply_fn,
                                  loss_fn=loss_fn,
                                  opt_update=optax.sgd(0.01).update,
                                  update_metrics=update_metrics))
 
-    _ = jax_utils.train(cfg=cfg,
-                        state=state,
+    reporter = jax_utils.Reporter(train_names=state.metrics.names(),
+                                  val_names=['loss', 'time'],
+                                  print_names=['loss'],
+                                  write_csv=False)
+    _ = jax_utils.train(state=state,
                         train_iter=train_iter(),
                         val_iter=list(islice(train_iter(), 0, 10)),
                         train_step=train_step,
                         val_step=eval_step,
-                        save_ckpts=False,
-                        write_csv=False)
+                        n_steps=500,
+                        report_freq=20,
+                        val_freq=100,
+                        reporter=reporter,
+                        val_metrics=state.metrics,
+                        save_ckpts=False)
