@@ -14,6 +14,11 @@ import tabulate
 from flax.traverse_util import flatten_dict, unflatten_dict
 from tqdm.auto import tqdm  # notebook compatible
 
+try:
+    from flax.training import checkpoints
+except Exception:
+    print('Could not import flax.training.checkpoints')
+
 MiniBatch = tp.Any
 LRSchedule = tp.Callable[[int], float]
 TrainStep = tp.Callable[['TrainState', MiniBatch], 'TrainState']
@@ -21,7 +26,7 @@ Variables = tp.Dict
 
 
 class Metrics(flax.struct.PyTreeNode):
-    state: tp.OrderedDict[str, tp.Tuple[float, float]]
+    state: tp.Mapping[str, tp.Tuple[float, float]]
 
     @classmethod
     def from_names(cls, *names):
@@ -47,12 +52,10 @@ class Metrics(flax.struct.PyTreeNode):
         return self.state.keys()
 
     def items(self):
-        for k in self.state:
-            yield k, self[k]
+        yield from zip(self.state.keys(), self.values())
 
     def values(self):
-        for _, v in self.items():
-            yield v
+        return _jit_values(list(self.state.values()))
 
     def reset(self):
         new_inst = self.from_names(*self.state.keys())
@@ -64,6 +67,11 @@ class Metrics(flax.struct.PyTreeNode):
         if not item:
             item = next(iter(self.state.values()), (0.0, 0.0))
         return hasattr(item[0], 'shape') and item[0].ndim > 0 and item[0].shape[0] > 1
+
+
+@jax.jit
+def _jit_values(values):
+    return [jnp.sum(v) / jnp.sum(c) for v, c in values]
 
 
 class PRNGSeq:
@@ -122,10 +130,10 @@ def find_lr(get_train_step: tp.Callable[[optax.TransformUpdateFn], TrainStep],
     train_step = jax.jit(get_train_step(optimizer.update))
 
     if distributed:
-        train_step = jax.pmap(get_train_step(optimizer), axis_name='batch')
+        train_step = jax.pmap(get_train_step(optimizer.update), axis_name='batch')
         state = flax.jax_utils.replicate(state)
 
-    avg_loss, best_loss = 0., 0.
+    avg_loss, best_loss = 0., float('inf')
     losses: tp.List[float] = []
     lrs: tp.List[float] = []
     for batch_num, batch in enumerate(train_iter, start=1):
@@ -134,8 +142,6 @@ def find_lr(get_train_step: tp.Callable[[optax.TransformUpdateFn], TrainStep],
         loss = state.metrics['loss']
         state = state.replace(metrics=state.metrics.reset())
         lr = sched(batch_num)
-        if distributed:
-            lr = flax.jax_utils.unreplicate(lr)
 
         # Compute the smoothed loss
         avg_loss = beta * avg_loss + (1 - beta) * loss
@@ -146,7 +152,7 @@ def find_lr(get_train_step: tp.Callable[[optax.TransformUpdateFn], TrainStep],
             return jnp.stack(lrs), jnp.stack(losses)
 
         # Record the best loss
-        if smoothed_loss < best_loss or batch_num == 1:
+        if smoothed_loss < best_loss:
             best_loss = smoothed_loss
 
         # Store the values
@@ -273,15 +279,15 @@ class Reporter:
                  summary_writer=_DummyWriter()):
 
         def get_header(x):
-            header = itertools.chain(['timestamp', 'iter'], list(x), ['time/step'],
+            header = itertools.chain(['timestamp', 'iter'], list(x),
                                      (f'val_{n}' for n in val_names))
             return list(header)
 
         self.train_names = train_names
         self.val_names = val_names
         self.print_names = train_names if print_names is None else print_names
-        self.header_csv = get_header(train_names)
-        self.header_print = get_header(print_names)
+        self.header_csv = get_header(self.train_names)
+        self.header_print = get_header(self.print_names)
         self.tabulate_csv = partial(tabulate_fn, headers=self.header_csv)
         self.tabulate_print = partial(tabulate_fn, headers=self.header_print)
         self.log_stamp = lambda: datetime.utcnow().strftime(printfmt)
@@ -297,33 +303,27 @@ class Reporter:
         print('\n'.join(
             self.tabulate_print([[self.log_stamp(), 100_000] + [1.0] *
                                  (len(self.header_print) - 2)]).split('\n')[:2]))
-        self.start_time = time.perf_counter()
-        self.iteration = -1
-
         return self
 
     def __exit__(self, *_):  # type, value, tb):
         self.csvfile.close()
 
     def report(self, iteration, train_dict, val_dict={}):
-        time_per_step = (time.perf_counter() - self.start_time) / (iteration -
-                                                                   self.iteration)
-
         prefix = [self.log_stamp(), iteration]
-        suffix = [time_per_step] + [val_dict.get(k, None) for k in self.val_names]
+        suffix = [val_dict.get(k, None) for k in self.val_names]
         csv_vals = prefix + [train_dict.get(k, None) for k in self.train_names] + suffix
         print_vals = prefix + [train_dict[k] for k in self.print_names] + suffix
 
         print(self.tabulate_print([print_vals]).split('\n')[2])
         self.traincsv.writerow(csv_vals)
 
-        self.start_time, self.iteration = time.perf_counter(), iteration
-
         for k, v in train_dict.items():
-            self.tb.scalar(k, v, iteration)
+            if isinstance(v, (int, float, jnp.ndarray)):
+                self.tb.scalar(k, v, iteration)
 
         for k, v in val_dict.items():
-            self.tb.scalar(f'val_{k}', v, iteration)
+            if isinstance(v, (int, float, jnp.ndarray)):
+                self.tb.scalar(f'val_{k}', v, iteration)
 
 
 def train(state: TrainState,
@@ -343,21 +343,29 @@ def train(state: TrainState,
 
     assert val_freq % report_freq == 0
     assert 'time' in reporter.val_names
+    assert 'time/step' in reporter.train_names
 
     iter_slice = itertools.islice(train_iter, 0, n_steps)
     train_iter = iter(tqdm(iter_slice, total=n_steps, desc='Training', smoothing=0))
 
+    if distributed:
+        state = flax.jax_utils.replicate(state)
+
     with reporter as rep:
         cur_best = -1
+        start_time = time.perf_counter()
         for i, batch in enumerate(train_iter):
             state = train_step(state, batch)
 
-            if i % report_freq == 0:
-                train_dict = dict(state.metrics.items())
-                val_dict = {}
+            if i % report_freq == 0 or i == n_steps - 1:
+                train_dict = {
+                    'time/step': (time.perf_counter() - start_time) / report_freq
+                }
+                train_dict.update(state.metrics.items())
                 state = state.replace(metrics=state.metrics.reset())
 
-                if i % val_freq == 0:
+                val_dict = {}
+                if i % val_freq == 0 or i == n_steps - 1:
                     start_time = time.perf_counter()
                     val_state = (state if not distributed else
                                  flax.jax_utils.unreplicate(state))
@@ -368,16 +376,20 @@ def train(state: TrainState,
                     val_dict = dict(val_metrics.items())
                     val_dict['time'] = time.perf_counter() - start_time
 
-                    ckpt_metric_val = val_metrics[ckpt_metric]
+                    ckpt_metric_val = val_dict[ckpt_metric]
                     if save_ckpts and cur_best < ckpt_metric_val:
+                        # TODO: Add comparison option (i.e. less or more is better)
                         cur_best = ckpt_metric_val
                         # OrderedDict can't be serialized
                         flat_state = jax.device_get(jax.tree_leaves(val_state))
-                        flax.training.checkpoints.save_checkpoint(f'ckpts_{ckpt_name}',
-                                                                  flat_state,
-                                                                  i,
-                                                                  keep=5)
+                        checkpoints.save_checkpoint(f'ckpts_{ckpt_name}',
+                                                    flat_state,
+                                                    i,
+                                                    keep=5)
+                        if 'ckpt' in reporter.val_names:
+                            val_dict['ckpt'] = 'Saved.'
 
                 rep.report(i, train_dict, val_dict)
+                start_time = time.perf_counter()
 
-    return state
+    return state if not distributed else flax.jax_utils.unreplicate(state)

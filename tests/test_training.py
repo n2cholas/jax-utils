@@ -89,7 +89,8 @@ def test_train_loop():
                                  opt_update=optax.sgd(0.01).update,
                                  update_metrics=update_metrics))
 
-    reporter = jax_utils.Reporter(train_names=state.metrics.names(),
+    reporter = jax_utils.Reporter(train_names=list(state.metrics.names()) +
+                                  ['time/step'],
                                   val_names=['loss', 'time'],
                                   print_names=['loss'],
                                   write_csv=False)
