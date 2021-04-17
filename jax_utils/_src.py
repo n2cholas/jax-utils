@@ -6,6 +6,7 @@ from collections import OrderedDict
 from datetime import datetime
 from functools import partial
 
+import chex
 import flax
 import jax
 import jax.numpy as jnp
@@ -19,14 +20,19 @@ try:
 except Exception:
     print('Could not import flax.training.checkpoints')
 
-MiniBatch = tp.Any
-LRSchedule = tp.Callable[[int], float]
+ArrayTree = tp.Any  # chex.ArrayTree is not supported yet
+MiniBatch = ArrayTree
+Variables = ArrayTree
+Params = ArrayTree
+ModelState = ArrayTree
+PRNGDict = tp.Dict[str, chex.PRNGKey]
 TrainStep = tp.Callable[['TrainState', MiniBatch], 'TrainState']
-Variables = tp.Dict
+ForwardFn = tp.Callable[[Variables, MiniBatch, tp.Optional[PRNGDict]],
+                        tp.Tuple[jnp.ndarray, tp.Tuple[chex.ArrayTree, ModelState]]]
 
 
 class Metrics(flax.struct.PyTreeNode):
-    state: tp.Mapping[str, tp.Tuple[float, float]]
+    state: tp.Mapping[str, tp.Tuple[chex.Numeric, chex.Numeric]]
 
     @classmethod
     def from_names(cls, *names):
@@ -91,12 +97,12 @@ class PRNGSeq:
 
 
 class TrainState(flax.struct.PyTreeNode):
-    trainable_params: tp.Dict
-    frozen_params: tp.Dict
-    model_state: tp.Dict
+    trainable_params: Params
+    frozen_params: Params
+    model_state: ModelState
     opt_state: optax.OptState
     metrics: Metrics
-    rngs: tp.Optional[tp.Dict[str, jnp.ndarray]]
+    rngs: tp.Optional[PRNGDict]
 
     @property
     def params(self):
@@ -108,7 +114,7 @@ class TrainState(flax.struct.PyTreeNode):
 
 
 def find_lr(get_train_step: tp.Callable[[optax.TransformUpdateFn], TrainStep],
-            optim_factory: tp.Callable[[LRSchedule], optax.GradientTransformation],
+            optim_factory: tp.Callable[[optax.Schedule], optax.GradientTransformation],
             state: TrainState,
             train_iter: tp.Iterator[MiniBatch],
             init_value: float = 1e-8,
@@ -183,14 +189,12 @@ def merge_nested_dicts(*ds):
     return unflatten_dict(merged)
 
 
-def get_train_step(
-    forward: tp.Callable[[Variables, MiniBatch, tp.Optional['RngDict']], 
-                         tp.Tuple[jnp.ndarray, tp.Tuple['Output', 'ModelState']]],
-    opt_update: optax.TransformUpdateFn,
-    update_metrics: tp.Callable[..., Metrics],
-    distributed: bool = False) -> TrainStep:
+def get_train_step(forward: ForwardFn,
+                   opt_update: optax.TransformUpdateFn,
+                   update_metrics: tp.Callable[..., Metrics],
+                   distributed: bool = False) -> TrainStep:
 
-    def train_step(state, batch):
+    def train_step(state: TrainState, batch: MiniBatch):
 
         def forward_fn(trainable_params):
             variables = {
@@ -236,10 +240,10 @@ def prep_data(ds, distributed=False):
     return flax.jax_utils.prefetch_to_device(it, 2) if distributed else it
 
 
-def cos_onecycle_momentum(num_steps,
-                          base_momentum=0.85,
-                          max_momentum=0.95,
-                          pct_start=0.3):
+def cos_onecycle_momentum(num_steps: int,
+                          base_momentum: float = 0.85,
+                          max_momentum: float = 0.95,
+                          pct_start: float = 0.3) -> optax.Schedule:
     """ Based on fastai and PyTorch
 
     - fastai1.fast.ai/callbacks.one_cycle.html
@@ -333,7 +337,7 @@ def train(state: TrainState,
           train_iter: tp.Iterator[MiniBatch],
           val_iter: tp.Iterator[MiniBatch],
           train_step: TrainStep,
-          val_step: tp.Callable[[MiniBatch, tp.Any, Metrics], Metrics],
+          val_step: tp.Callable[[MiniBatch, Variables, Metrics], Metrics],
           n_steps: int,
           val_freq: int,
           report_freq: int,

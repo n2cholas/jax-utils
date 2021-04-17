@@ -25,29 +25,28 @@ state = jax_utils.TrainState(trainable_params=variables['params'],
                              frozen_params={},
                              model_state={},
                              opt_state=optax.sgd(0.01).init(variables['params']),
-                             metrics=jax_utils.Metrics.from_names('loss'))
+                             metrics=jax_utils.Metrics.from_names('loss'),
+                             rngs=None)
 
 
-def apply_fn(variables, batch):
-    return model.apply(variables, batch['input']), {}
+def forward(variables, batch, rngs=None):
+    del rngs
+    out = model.apply(variables, batch['input'])
+    loss = optax.l2_loss(out, batch['target']).mean()
+    return loss, (out, {})
 
 
-def loss_fn(output, batch):
-    return optax.l2_loss(output, batch['target']).mean()
-
-
-def update_metrics(state, batch, loss, output, grads):
+def update_metrics(state, batch, loss, output, grads, updates):
     return state.metrics.update(loss=loss)
 
 
 def eval_step(batch, variables, metrics):
-    output = model.apply(variables, batch['input'])
-    return metrics.update(loss=loss_fn(output, batch))
+    loss, (out, _) = forward(variables, batch)
+    return metrics.update(loss=loss)
 
 
 def get_find_lr_train_step(update_fn):
-    return jax_utils.get_train_step(apply_fn=apply_fn,
-                                    loss_fn=loss_fn,
+    return jax_utils.get_train_step(forward=forward,
                                     opt_update=update_fn,
                                     update_metrics=update_metrics)
 
@@ -63,8 +62,7 @@ def test_find_lr():
 
 def test_train_step():
     train_step = jax.jit(
-        jax_utils.get_train_step(apply_fn=apply_fn,
-                                 loss_fn=loss_fn,
+        jax_utils.get_train_step(forward=forward,
                                  opt_update=optax.sgd(0.01).update,
                                  update_metrics=update_metrics))
 
@@ -72,7 +70,7 @@ def test_train_step():
     init_loss = state_.metrics['loss']
     for i, batch_ in enumerate(train_iter()):
         state_ = state_.replace(metrics=state_.metrics.reset())
-        state_ = train_step(state_, batch)
+        state_ = train_step(state_, batch_)
         if i > 25:
             break
 
@@ -84,8 +82,7 @@ def test_train_step():
 def test_train_loop():
 
     train_step = jax.jit(
-        jax_utils.get_train_step(apply_fn=apply_fn,
-                                 loss_fn=loss_fn,
+        jax_utils.get_train_step(forward=forward,
                                  opt_update=optax.sgd(0.01).update,
                                  update_metrics=update_metrics))
 
