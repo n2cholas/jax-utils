@@ -94,8 +94,9 @@ class TrainState(flax.struct.PyTreeNode):
     trainable_params: tp.Dict
     frozen_params: tp.Dict
     model_state: tp.Dict
-    opt_state: tp.Dict
+    opt_state: optax.OptState
     metrics: Metrics
+    rngs: tp.Optional[tp.Dict[str, jnp.ndarray]]
 
     @property
     def params(self):
@@ -182,25 +183,23 @@ def merge_nested_dicts(*ds):
     return unflatten_dict(merged)
 
 
-def get_train_step(apply_fn: tp.Callable[[Variables, MiniBatch], tp.Tuple[tp.Any,
-                                                                          tp.Dict]],
-                   loss_fn: tp.Callable[[tp.Any, MiniBatch], jnp.ndarray],
-                   opt_update: optax.TransformUpdateFn,
-                   update_metrics: tp.Callable[..., Metrics],
-                   distributed: bool = False) -> TrainStep:
+def get_train_step(
+    forward: tp.Callable[[Variables, MiniBatch, tp.Optional['RngDict']], 
+                         tp.Tuple[jnp.ndarray, tp.Tuple['Output', 'ModelState']]],
+    opt_update: optax.TransformUpdateFn,
+    update_metrics: tp.Callable[..., Metrics],
+    distributed: bool = False) -> TrainStep:
 
     def train_step(state, batch):
 
-        def forward(trainable_params):
+        def forward_fn(trainable_params):
             variables = {
                 'params': merge_nested_dicts(trainable_params, state.frozen_params),
                 **state.model_state
             }
-            output, model_state = apply_fn(variables, batch)
-            loss = loss_fn(output, batch)
-            return loss, (output, model_state)
+            return forward(variables, batch, state.rngs)
 
-        grad_fn = jax.value_and_grad(forward, has_aux=True)
+        grad_fn = jax.value_and_grad(forward_fn, has_aux=True)
         (loss, (output, model_state)), grads = grad_fn(state.trainable_params)
 
         if distributed:
@@ -212,12 +211,16 @@ def get_train_step(apply_fn: tp.Callable[[Variables, MiniBatch], tp.Tuple[tp.Any
                                  batch=batch,
                                  loss=loss,
                                  output=output,
-                                 grads=grads)
+                                 grads=grads,
+                                 updates=updates)
+
+        rngs = jax.tree_map(partial(jax.random.fold_in, data=0), state.rngs)
 
         return state.replace(trainable_params=new_params,
                              model_state=model_state,
                              opt_state=opt_state,
-                             metrics=metrics)
+                             metrics=metrics,
+                             rngs=rngs)
 
     return train_step
 
