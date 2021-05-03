@@ -1,3 +1,8 @@
-from ._src import *  # noqa
+from jax_resnet import *  # noqa
 
-__version__ = '0.0.1'
+from .layers import *  # noqa
+from .pytypes import *  # noqa
+from .training import *  # noqa
+from .utils import *  # noqa
+
+__version__ = '0.0.2'
