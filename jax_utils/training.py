@@ -172,7 +172,8 @@ def train(
     save_ckpts: bool = True,
     ckpt_metric: str = 'loss',
     ckpt_name: str = 'model',
-    extra_report_fn: T.Optional[T.Callable[[TrainState], None]] = None,
+    extra_report_fn: T.Optional[T.Callable[[TrainState, int], None]] = None,
+    start_step: int = 0,
 ) -> TrainState:
 
     assert 'time/step' in reporter.train_names
@@ -182,16 +183,20 @@ def train(
         assert val_freq is not None and val_freq % report_freq == 0
         assert 'time' in reporter.val_names
 
-    iter_slice = itertools.islice(train_iter, 0, n_steps)
-    train_iter = iter(tqdm(iter_slice, total=n_steps, desc='Training', smoothing=0))
+    iter_slice = itertools.islice(train_iter, 0, n_steps-start_step)
+    train_iter = iter(tqdm(iter_slice, total=n_steps-start_step, desc='Training'))
 
     if distributed:
         state = flax.jax_utils.replicate(state)
+        if hasattr(state, 'rngs'):
+            pfold_in = partial(jax.pmap(jax.random.fold_in),
+                               data=jnp.arange(jax.device_count()))
+            state = state.replace(rngs=jax.tree_map(pfold_in, state.rngs))
 
     with reporter as rep:
         cur_best = -1
         start_time = time.perf_counter()
-        for i, batch in enumerate(train_iter):
+        for i, batch in enumerate(train_iter, start=start_step):
             state = train_step(state, batch)
 
             if i % report_freq == 0 or i == n_steps - 1:
@@ -229,7 +234,9 @@ def train(
 
                 rep.report(i, train_dict, val_dict)
                 if extra_report_fn is not None:
-                    extra_report_fn(flax.jax_utils.unreplicate(state))
+                    val_state = (state if not distributed else
+                                 flax.jax_utils.unreplicate(state))
+                    extra_report_fn(val_state, i)
                 start_time = time.perf_counter()
 
     return state if not distributed else flax.jax_utils.unreplicate(state)
