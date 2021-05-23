@@ -139,6 +139,7 @@ class Reporter:
     def __exit__(self, *_):  # type, value, tb):
         self.csvfile.close()
 
+    @T.no_type_check
     def report(self,
                iteration: int,
                train_dict: T.Mapping[str, chex.Scalar],
