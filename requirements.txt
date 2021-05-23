@@ -1,7 +1,6 @@
 flax
 jax
 jaxlib
-jax-resnet
 numpy
 optax
 tabulate

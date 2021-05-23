@@ -1,5 +1,6 @@
+import math
 import typing as T
-from functools import partial
+from functools import partial, wraps
 
 import chex
 import flax
@@ -7,6 +8,17 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax.traverse_util import flatten_dict, unflatten_dict
+
+# From https://pytorch.org/docs/stable/nn.init.html#torch.nn.init.calculate_gain
+INIT_GAIN: T.Dict[str, T.Callable[..., float]] = {
+    'linear': lambda *_: 1.0,
+    'conv': lambda *_: 1.0,
+    'sigmoid': lambda *_: 1.0,
+    'tanh': lambda *_: 5.0 / 3.0,
+    'relu': lambda *_: math.sqrt(2.0),
+    'leaky_relu': lambda ns: math.sqrt(2.0 / (1.0 + ns**2)),  # ns = negative_slope
+    'selu': lambda *_: 3.0 / 4.0,
+}
 
 
 class Metrics(flax.struct.PyTreeNode):
@@ -118,3 +130,29 @@ def cos_onecycle_momentum(num_steps: int,
             int(pct_start * num_steps): base_momentum / max_momentum,
             int(num_steps): max_momentum / base_momentum
         })
+
+
+def assert_dtype(f):
+
+    @wraps(f)
+    def inner(x, *args, **kwargs):
+        out = f(x, *args, **kwargs)
+        chex.assert_equal(x.dtype, out.dtype)
+        return out
+
+    return inner
+
+
+@assert_dtype
+def lerp(a, b, pct):
+    chex.assert_equal_shape([a, b])  # avoid unwanted broadcasting
+    chex.assert_rank(pct, {0, jnp.ndim(a)})  # avoid implicit 1-dimensions
+    return a + (b - a) * pct
+
+
+def truncated_normal_init(lower, upper):
+
+    def init_fn(key, shape, dtype=jnp.float32):
+        return jax.random.truncated_normal(key, lower, upper, shape, dtype)
+
+    return init_fn

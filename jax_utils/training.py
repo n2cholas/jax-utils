@@ -5,6 +5,7 @@ import typing as T
 from datetime import datetime
 from functools import partial
 
+import chex
 import flax
 import jax
 import jax.numpy as jnp
@@ -97,16 +98,16 @@ def get_train_step(forward: PT.ForwardFn,
 class Reporter:
 
     def __init__(self,
-                 train_names,
-                 val_names,
-                 print_names=None,
-                 filefmt='%Y-%m-%d_%H-%M-%S',
-                 printfmt='%Y-%m-%d %H:%M:%S',
-                 tabulate_fn=partial(tabulate.tabulate,
-                                     tablefmt="github",
-                                     floatfmt="9.4f"),
-                 write_csv=False,
-                 summary_writer=_DummyWriter()):
+                 train_names: T.Sequence[str],
+                 val_names: T.Sequence[str],
+                 print_names: T.Optional[T.Sequence[str]] = None,
+                 filefmt: str = '%Y-%m-%d_%H-%M-%S',
+                 printfmt: str = '%Y-%m-%d %H:%M:%S',
+                 tabulate_fn: T.Callable = partial(tabulate.tabulate,
+                                                   tablefmt="github",
+                                                   floatfmt="9.4f"),
+                 write_csv: bool = False,
+                 summary_writer: T.Optional[T.Any] = None):
 
         def get_header(x):
             header = itertools.chain(['timestamp', 'iter'], list(x),
@@ -124,13 +125,13 @@ class Reporter:
         self.open_csv = lambda: (open(
             f'{datetime.utcnow().strftime(filefmt)}_trainlog.csv', 'w', newline='')
                                  if write_csv else _DummyWriter())
-        self.tb = summary_writer
+        self.tb = summary_writer or _DummyWriter()
 
     def __enter__(self):
         self.csvfile = self.open_csv()
         self.traincsv = csv.writer(self.csvfile, quoting=csv.QUOTE_MINIMAL)
         self.traincsv.writerow(self.header_csv)
-        print('\n'.join(
+        tqdm.write('\n'.join(
             self.tabulate_print([[self.log_stamp(), 100_000] + [1.0] *
                                  (len(self.header_print) - 2)]).split('\n')[:2]))
         return self
@@ -138,13 +139,16 @@ class Reporter:
     def __exit__(self, *_):  # type, value, tb):
         self.csvfile.close()
 
-    def report(self, iteration, train_dict, val_dict={}):
+    def report(self,
+               iteration: int,
+               train_dict: T.Mapping[str, chex.Scalar],
+               val_dict: T.Mapping[str, chex.Scalar] = {}):
         prefix = [self.log_stamp(), iteration]
         suffix = [val_dict.get(k, None) for k in self.val_names]
         csv_vals = prefix + [train_dict.get(k, None) for k in self.train_names] + suffix
         print_vals = prefix + [train_dict[k] for k in self.print_names] + suffix
 
-        print(self.tabulate_print([print_vals]).split('\n')[2])
+        tqdm.write(self.tabulate_print([print_vals]).split('\n')[2])
         self.traincsv.writerow(csv_vals)
 
         for k, v in train_dict.items():
@@ -172,7 +176,8 @@ def train(
     save_ckpts: bool = True,
     ckpt_metric: str = 'loss',
     ckpt_name: str = 'model',
-    extra_report_fn: T.Optional[T.Callable[[TrainState, int], None]] = None,
+    extra_report_fn: T.Optional[T.Callable[[TrainState, PT.MiniBatch, int],
+                                           None]] = None,
     start_step: int = 0,
 ) -> TrainState:
 
@@ -183,8 +188,8 @@ def train(
         assert val_freq is not None and val_freq % report_freq == 0
         assert 'time' in reporter.val_names
 
-    iter_slice = itertools.islice(train_iter, 0, n_steps-start_step)
-    train_iter = iter(tqdm(iter_slice, total=n_steps-start_step, desc='Training'))
+    iter_slice = itertools.islice(train_iter, 0, n_steps - start_step)
+    train_iter = iter(tqdm(iter_slice, total=n_steps - start_step, desc='Training'))
 
     if distributed:
         state = flax.jax_utils.replicate(state)
@@ -234,9 +239,11 @@ def train(
 
                 rep.report(i, train_dict, val_dict)
                 if extra_report_fn is not None:
-                    val_state = (state if not distributed else
-                                 flax.jax_utils.unreplicate(state))
-                    extra_report_fn(val_state, i)
+                    if distributed:
+                        rstate, rbatch = flax.jax_utils.unreplicate((state, batch))
+                    else:
+                        rstate, rbatch = state, batch
+                    extra_report_fn(rstate, rbatch, i)
                 start_time = time.perf_counter()
 
     return state if not distributed else flax.jax_utils.unreplicate(state)

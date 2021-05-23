@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 import jax_utils
 
@@ -42,3 +43,23 @@ def test_partition_nested_dict():
     left, right = jax_utils.partition_nested_dict(d, left_keys)
     assert left == {'a': {'c': [2, 3]}, 'd': 4}
     assert right == {'a': {'b': 1, 'e': 6}, 'f': 7, 'g': 8}
+
+
+def test_lerp():
+    a = np.ones((5, 6))
+    b = np.full((5, 6), 2)
+    out = jax_utils.lerp(a, b, 0.9)
+    np.testing.assert_allclose(out, 1.9)
+
+
+def test_assert_dtype():
+
+    @jax_utils.assert_dtype
+    def f(x, y):
+        return (x + y).astype(np.int32)
+
+    x = y = np.ones(1, dtype=np.int32)
+    assert f(x, y) == 2
+    x = y = np.ones(1, dtype=np.float16)
+    with pytest.raises(AssertionError):
+        f(x, y)
