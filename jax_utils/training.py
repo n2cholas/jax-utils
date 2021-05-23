@@ -1,4 +1,6 @@
+import contextlib
 import csv
+import inspect
 import itertools
 import time
 import typing as T
@@ -161,6 +163,24 @@ class Reporter:
                 self.tb.scalar(f'val_{k}', v, iteration)
 
 
+@contextlib.contextmanager
+def redirect_print_to_tqdm():
+    # From https://stackoverflow.com/a/42424890/7546401
+    old_print = print
+
+    def new_print(*args, **kwargs):
+        try:
+            tqdm.write(*args, **kwargs)
+        except Exception:
+            old_print(*args, **kwargs)
+
+    try:
+        inspect.builtins.print = new_print
+        yield
+    finally:
+        inspect.builtins.print = old_print
+
+
 def train(
     state: TrainState,
     *,
@@ -199,7 +219,7 @@ def train(
                                data=jnp.arange(jax.device_count()))
             state = state.replace(rngs=jax.tree_map(pfold_in, state.rngs))
 
-    with reporter as rep:
+    with reporter as rep, redirect_print_to_tqdm():
         cur_best = -1
         start_time = time.perf_counter()
         for i, batch in enumerate(train_iter, start=start_step):
